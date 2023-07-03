@@ -1,6 +1,12 @@
 import ccxt
 import asyncio
 import datetime
+import nest_asyncio
+import math 
+import ccxt.async_support as ccxt
+
+# 非同期I/Oを使うためのセットアップ
+nest_asyncio.apply()
 
 # BitflyerのAPIキーとシークレットキーを設定
 api_key = ''
@@ -12,94 +18,148 @@ exchange = ccxt.bitflyer({
     'secret': api_secret,
 })
 
+# OHLCVを作成する関数
+def build_ohlcv(trades, timeframe):
+    # Change timestamp to datetime object for proper comparison
+    sorted_trades = sorted(trades, key=lambda x: datetime.datetime.strptime(x['timestamp'], "%Y-%m-%dT%H:%M:%S.%fZ"))
+    grouped_trades = []
+    current_group = []
+    current_timestamp = datetime.datetime.strptime(sorted_trades[0]['timestamp'], "%Y-%m-%dT%H:%M:%S.%fZ")
+    for trade in sorted_trades:
+        trade_time = datetime.datetime.strptime(trade['timestamp'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        if (trade_time - current_timestamp).seconds < timeframe * 60:
+            current_group.append(trade)
+        else:
+            grouped_trades.append(current_group)
+            current_group = [trade]
+            current_timestamp = trade_time
+
+    ohlcv_data = []
+    for trades in grouped_trades:
+        timestamps = [datetime.datetime.strptime(x['timestamp'], "%Y-%m-%dT%H:%M:%S.%fZ") for x in trades]
+        prices = [x['price'] for x in trades]
+        volumes = [x['amount'] for x in trades]
+        ohlcv_data.append([
+            min(timestamps),
+            prices[0],
+            max(prices),
+            min(prices),
+            prices[-1],
+            sum(volumes)
+        ])
+
+    return ohlcv_data
+
+# 約定履歴を取得する関数
+async def fetch_executions(symbol='BTC/JPY', limit=1000):
+    try:
+        # Bitflyerのgetexecutionsエンドポイントを直接呼び出す
+        executions = await exchange.private_get_getexecutions({
+            'product_code': exchange.market_id(symbol),
+            'count': limit,
+        })
+
+        # 約定履歴をTrade形式に変換
+        trades = [{'timestamp': ex['exec_date'], 'price': ex['price'], 'amount': ex['size']} for ex in executions]
+        return trades
+    except Exception as e:
+        # 約定履歴の取得に失敗した場合、エラーメッセージを出力
+        print(f"Failed to fetch executions: {e}")
+        return None
+
 # 資産情報を取得する関数
 async def get_asset_info():
     try:
+        # 資産情報を取得
         return await exchange.fetch_balance()
     except Exception as e:
-        print("Failed to get asset info:", e)
+        # 資産情報の取得に失敗した場合、エラーメッセージを出力
+        print(f"Failed to get asset info: {e}")
         return None
 
 # 注文をキャンセルする関数
-async def cancel_all_orders():
+async def cancel_all_orders(symbol='BTC/JPY'):
     try:
-        await exchange.cancel_all_orders()
+        # 全ての注文情報を取得
+        open_orders = await exchange.fetch_open_orders(symbol)
+        # 各注文についてキャンセルを行う
+        for order in open_orders:
+            await exchange.cancel_order(order['id'], symbol)
         print("All orders cancelled successfully.")
     except Exception as e:
-        print("Failed to cancel all orders:", e)
+        # 注文のキャンセルに失敗した場合、エラーメッセージを出力
+        print(f"Failed to cancel all orders: {e}")
+        return None
 
 # 決済注文を発注する関数
-async def place_exit_order(asset_info):
+async def place_exit_order(asset_info, ohlcv, symbol='BTC/JPY'):
     try:
-        # 直近120分の安値を取得
-        candles = await exchange.fetch_ohlcv('BTC/JPY', timeframe='1m', limit=120)
-        low_prices = [candle[3] for candle in candles]
+        # 直近のOHLCVデータを取得
+        last_candle = ohlcv[-1]
+        low_prices = [candle[3] for candle in ohlcv]
         lowest_price = min(low_prices)
 
         # 10%上昇した価格を計算
         exit_price = lowest_price * (1 + 0.1)
 
         # 決済指値の執行注文
-        order = await exchange.create_limit_order('BTC/JPY', 'sell', asset_info['free']['BTC'], exit_price)
-
-        # 注文の実行
-        await exchange.create_order(order['symbol'], order['type'], order['side'], order['amount'], order['price'])
+        await exchange.create_limit_order(symbol, 'sell', asset_info['free']['BTC'], exit_price)
 
         print("Exit order placed successfully.")
     except Exception as e:
-        print("Failed to place exit order:", e)
+        # 決済注文の発注に失敗した場合、エラーメッセージを出力
+        print(f"Failed to place exit order: {e}")
 
 # 建て玉を保有しているかどうかを判定する関数
 def has_long_position(asset_info):
-    if asset_info and 'BTC' in asset_info['free']:
-        return True
-    else:
-        return False
+    # 資産情報が存在し、BTCの保有量がある場合はTrueを返す
+    return asset_info and 'BTC' in asset_info['free']
 
 # メインのトレードロジック
-async def trade_logic():
-    # レバレッジ倍率と証拠金を設定
-    leverage = 2
-    initial_margin = 10000  # 証拠金
-
-    # N分間の高値とR%の価格下落を設定
-    minutes = 120
-    price_drop_percentage = 0.1
-
+async def trade_logic(minutes=120, price_drop_percentage=0.1):
     while True:
-        # 現在の時刻を取得
         current_time = datetime.datetime.now()
 
-        # 注文解消時間（毎時間0分）に指値を解消
         if current_time.minute == 0:
-            # 既存の注文を解消する処理
             await cancel_all_orders()
 
-            # 資産情報を非同期に取得
             asset_info = await get_asset_info()
 
-            # Longの建て玉を保有している場合は決済注文を発注
             if has_long_position(asset_info):
-                await place_exit_order(asset_info)
+                trades = await fetch_executions()
+                ohlcv = build_ohlcv(trades, timeframe=1)
+
+                await place_exit_order(asset_info, ohlcv)
             else:
-                # 過去のデータを取得
+                if asset_info and 'JPY' in asset_info['free']:
+                    free_jpy = asset_info['free']['JPY']
+                    if free_jpy <= 0:
+                        print("Insufficient margin. Please deposit funds.")
+                        await asyncio.sleep(60)
+                        continue
+
+                trades = await fetch_executions()
+                ohlcv = build_ohlcv(trades, timeframe=1)
+
                 candles = await exchange.fetch_ohlcv('BTC/JPY', timeframe='1m', limit=minutes)
 
-                # N分間の高値を取得
                 high_price = [candle[2] for candle in candles]
                 highest_price = max(high_price)
 
-                # エントリー価格を計算
                 entry_price = highest_price * (1 - price_drop_percentage)
 
-                # エントリー指値の執行注文
-                order = await exchange.create_limit_order('BTC/JPY', 'buy', leverage * initial_margin / entry_price, entry_price)
+                symbol = 'BTC/JPY'
+                amount = free_jpy / entry_price
+                amount = math.floor(amount * 1000) / 1000
 
-                # 注文の実行
-                await exchange.create_order(order['symbol'], order['type'], order['side'], order['amount'], order['price'])
+                await exchange.create_limit_order(symbol, 'buy', amount, entry_price)
 
-        # 1分ごとにループを実行
+                print("Entry order placed successfully.")
+
         await asyncio.sleep(60)
 
-# トレードロジックの実行
-asyncio.run(trade_logic())
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(trade_logic())
+finally:
+    loop.run_until_complete(exchange.close())
